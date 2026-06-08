@@ -37,7 +37,7 @@ from openpyxl.utils import get_column_letter
 # Столбцы для УДАЛЕНИЯ — все совпадения убираются из файлов.
 # Добавляйте любые дополнительные имена.
 DROP_COLUMNS: List[str] = [
-    'n3', 'n4', 'n7', 'n8', 'e1', 'e2', 'e3'
+    'n3', 'n4', 'n7', 'n8',
 ]
 
 # Возможные названия столбца с ХОСТАМИ — используется первое найденное.
@@ -126,6 +126,33 @@ def get_source_files(folder_path: str) -> List[Path]:
     )
 
 
+def is_file_locked(path: Path) -> bool:
+    """Возвращает True, если файл открыт другой программой."""
+    # Office создаёт скрытый ~$filename при открытии
+    lock = path.parent / f'~${path.name}'
+    if lock.exists():
+        return True
+    # Пробуем открыть в эксклюзивном режиме
+    try:
+        with open(path, 'r+b'):
+            pass
+        return False
+    except (IOError, OSError, PermissionError):
+        return True
+
+
+def check_file_locks(folder_path: str) -> List[str]:
+    """Возвращает список имён файлов, которые заблокированы."""
+    locked = []
+    for p in Path(folder_path).iterdir():
+        if (p.is_file()
+                and p.suffix.lower() in {'.csv', '.xls', '.xlsx', '.xlsm'}
+                and p.name != OUTPUT_FILENAME
+                and is_file_locked(p)):
+            locked.append(p.name)
+    return sorted(locked)
+
+
 # ══════════════════════════════════════════════════════════════════════════
 #  Этап 1: обработка исходных файлов
 #
@@ -141,25 +168,27 @@ def get_source_files(folder_path: str) -> List[Path]:
 
 def process_csv(filepath: str, fname: str) -> List[Tuple[str, str]]:
     """
-    Обработка CSV:
-      – читает файл чанками по CHUNK_SIZE строк  ← гарантированное чанкование
-      – удаляет DROP_COLUMNS
-      – собирает уникальные хосты (включая пустые)
-      – перезаписывает файл через temp-файл
+    CSV читается итератором чанков по CHUNK_SIZE строк.
+    В лог выводится номер каждого чанка и диапазон строк.
     """
     path  = Path(filepath)
     tmp   = path.with_suffix('.tmp.csv')
     hosts: Set[str] = set()
     enc   = detect_csv_encoding(path)
     t0    = time.perf_counter()
+    chunk_num = 0
     rows_read = 0
 
     try:
         first = True
-        # pd.read_csv с chunksize возвращает итератор — каждый чанк независим
         for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE,
                                   encoding=enc, low_memory=False):
+            chunk_num += 1
+            r0 = rows_read + 1
             rows_read += len(chunk)
+            log.debug(f"  ↳ {fname}: чанк {chunk_num}  "
+                      f"(строки {r0:,} – {rows_read:,})")
+
             hcol = find_host_col_df(chunk)
             if hcol:
                 hosts.update(chunk[hcol].fillna('').astype(str).unique())
@@ -175,8 +204,12 @@ def process_csv(filepath: str, fname: str) -> List[Tuple[str, str]]:
 
         os.replace(tmp, path)
         t = time.perf_counter() - t0
-        log.info(f"[CSV]   {path.name}  |  {rows_read:,} строк  |  "
-                 f"{len(hosts)} хостов  |  {t:.2f}с")
+        log.info(f"[CSV]   {fname}  |  {chunk_num} чанк(ов)  |  "
+                 f"{rows_read:,} строк  |  {len(hosts)} хостов  |  {t:.2f}с")
+    except PermissionError:
+        _remove(tmp)
+        raise PermissionError(
+            f"Файл занят другой программой (закройте и повторите): {fname}")
     except Exception:
         _remove(tmp)
         raise
@@ -186,10 +219,10 @@ def process_csv(filepath: str, fname: str) -> List[Tuple[str, str]]:
 
 def process_xlsx(filepath: str, fname: str) -> List[Tuple[str, str]]:
     """
-    Обработка XLSX:
-      – openpyxl read_only=True: потоковое чтение строка за строкой (не в ОЗУ)
-      – openpyxl write_only=True: потоковая запись нового файла
-      – оба режима вместе дают O(1) памяти независимо от размера файла
+    XLSX: потоковое чтение/запись через openpyxl (O(1) памяти).
+    Строки дополняются до ширины заголовка (sparse-формат xlsx может
+    опускать хвостовые пустые ячейки, что вызывает IndexError).
+    Прогресс выводится каждые CHUNK_SIZE строк.
     """
     path  = Path(filepath)
     tmp   = path.with_suffix('.tmp.xlsx')
@@ -202,11 +235,12 @@ def process_xlsx(filepath: str, fname: str) -> List[Tuple[str, str]]:
         ws_r = wb_r.active
         it   = ws_r.iter_rows(values_only=True)
 
-        hdr_raw = list(next(it))
-        hdr     = [str(h) if h is not None else '' for h in hdr_raw]
-        drop_i  = get_drop_idx(hdr)
-        host_i  = find_host_idx(hdr)
-        new_hdr = [h for i, h in enumerate(hdr_raw) if i not in drop_i]
+        hdr_raw  = list(next(it))
+        hdr_len  = len(hdr_raw)
+        hdr      = [str(h) if h is not None else '' for h in hdr_raw]
+        drop_i   = get_drop_idx(hdr)
+        host_i   = find_host_idx(hdr)
+        new_hdr  = [h for i, h in enumerate(hdr_raw) if i not in drop_i]
 
         wb_w = openpyxl.Workbook(write_only=True)
         ws_w = wb_w.create_sheet()
@@ -214,18 +248,31 @@ def process_xlsx(filepath: str, fname: str) -> List[Tuple[str, str]]:
 
         for row in it:
             rows_read += 1
+            # Дополняем разреженные строки до длины заголовка
+            r = list(row)
+            if len(r) < hdr_len:
+                r.extend([None] * (hdr_len - len(r)))
+
             if host_i is not None:
-                h = row[host_i]
+                h = r[host_i]
                 hosts.add('' if h is None else str(h))
-            # write_only.append() записывает сразу — строк накоплено в памяти 1
-            ws_w.append([v for i, v in enumerate(row) if i not in drop_i])
+
+            ws_w.append([v for i, v in enumerate(r) if i not in drop_i])
+
+            if rows_read % CHUNK_SIZE == 0:
+                log.debug(f"  ↳ {fname}: {rows_read:,} строк  "
+                          f"({time.perf_counter()-t0:.1f}с)")
 
         wb_r.close()
         wb_w.save(tmp)
         os.replace(tmp, path)
         t = time.perf_counter() - t0
-        log.info(f"[XLSX]  {path.name}  |  {rows_read:,} строк  |  "
+        log.info(f"[XLSX]  {fname}  |  {rows_read:,} строк  |  "
                  f"{len(hosts)} хостов  |  {t:.2f}с")
+    except PermissionError:
+        _remove(tmp)
+        raise PermissionError(
+            f"Файл занят другой программой (закройте и повторите): {fname}")
     except Exception:
         _remove(tmp)
         raise
@@ -309,7 +356,7 @@ def run_phase1(folder_path: str,
                 log.error(f"Ошибка [{done}/{len(files)}] {fname}: {exc}",
                            exc_info=True)
             if progress_cb:
-                progress_cb(done, len(files))
+                progress_cb(done, len(files), fname)
 
     log.info(f"Этап 1 завершён: {len(files)} файлов, "
              f"{len(all_rows)} хостов, {time.perf_counter()-t0:.2f}с")
@@ -360,14 +407,22 @@ def save_hosts_xlsx(all_rows: List[Tuple[str, str]], out: Path) -> None:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _rewrite_csv(fp: Path, transform) -> None:
-    """Базовая перезапись CSV чанками. transform(chunk) -> chunk."""
+    """Перезапись CSV чанками. transform(chunk) -> chunk | None."""
     enc = detect_csv_encoding(fp)
     tmp = fp.with_suffix('.tmp.csv')
     try:
-        first = True
+        first     = True
         wrote_any = False
+        chunk_num = 0
+        rows_done = 0
+        t0 = time.perf_counter()
         for chunk in pd.read_csv(fp, chunksize=CHUNK_SIZE,
                                   encoding=enc, low_memory=False):
+            chunk_num += 1
+            r0 = rows_done + 1
+            rows_done += len(chunk)
+            log.debug(f"  ↳ {fp.name}: чанк {chunk_num}  "
+                      f"(строки {r0:,} – {rows_done:,})")
             chunk = transform(chunk)
             if chunk is None or chunk.empty:
                 continue
@@ -379,19 +434,22 @@ def _rewrite_csv(fp: Path, transform) -> None:
         if wrote_any:
             os.replace(tmp, fp)
         else:
-            # все строки удалены — оставляем файл с заголовком
             pd.read_csv(fp, nrows=0, encoding=enc).to_csv(
                 fp, index=False, encoding='utf-8-sig')
             _remove(tmp)
+    except PermissionError:
+        _remove(tmp)
+        raise PermissionError(
+            f"Файл занят другой программой (закройте и повторите): {fp.name}")
     except Exception:
         _remove(tmp); raise
 
 
 def _rewrite_xlsx(fp: Path, transform_row, new_headers_fn=None) -> None:
     """
-    Базовая потоковая перезапись XLSX.
-    transform_row(row_list, hdr) -> row_list | None (None = удалить строку)
-    new_headers_fn(hdr) -> new_hdr_list  (если нужно добавить/изменить столбцы)
+    Потоковая перезапись XLSX.
+    Строки дополняются до длины заголовка — исправляет IndexError на sparse-файлах
+    (xlsx может не хранить хвостовые пустые ячейки, тогда row короче hdr).
     """
     tmp = fp.with_suffix('.tmp.xlsx')
     try:
@@ -399,19 +457,36 @@ def _rewrite_xlsx(fp: Path, transform_row, new_headers_fn=None) -> None:
         ws_r = wb_r.active
         it   = ws_r.iter_rows(values_only=True)
         hdr_raw = list(next(it))
+        hdr_len = len(hdr_raw)
         hdr     = [str(h) if h is not None else '' for h in hdr_raw]
-        new_hdr = new_headers_fn(hdr) if new_headers_fn else hdr_raw
+        new_hdr = new_headers_fn(hdr) if new_headers_fn else list(hdr_raw)
 
         wb_w = openpyxl.Workbook(write_only=True)
         ws_w = wb_w.create_sheet()
         ws_w.append(new_hdr)
 
+        rows_done = 0
+        t0 = time.perf_counter()
         for row in it:
-            r = transform_row(list(row), hdr)
+            r = list(row)
+            # Padding: sparse xlsx omits trailing empty cells
+            if len(r) < hdr_len:
+                r.extend([None] * (hdr_len - len(r)))
+            r = transform_row(r, hdr)
             if r is not None:
                 ws_w.append(r)
+            rows_done += 1
+            if rows_done % CHUNK_SIZE == 0:
+                log.debug(f"  ↳ {fp.name}: {rows_done:,} строк  "
+                          f"({time.perf_counter()-t0:.1f}с)")
 
-        wb_r.close(); wb_w.save(tmp); os.replace(tmp, fp)
+        wb_r.close()
+        wb_w.save(tmp)
+        os.replace(tmp, fp)
+    except PermissionError:
+        _remove(tmp)
+        raise PermissionError(
+            f"Файл занят другой программой (закройте и повторите): {fp.name}")
     except Exception:
         _remove(tmp); raise
 
@@ -616,7 +691,11 @@ class _GUILogHandler(logging.Handler):
 # ══════════════════════════════════════════════════════════════════════════
 
 class ReplacementDialog(tk.Toplevel):
-    """Модальный диалог: для каждого файла — поле ввода замены хостов."""
+    """
+    Модальный диалог: для каждого файла — поле ввода замены хостов.
+    Можно заполнить не все поля — незаполненные файлы будут пропущены
+    с предупреждением.
+    """
 
     def __init__(self, parent: tk.Tk, filenames: List[str]):
         super().__init__(parent)
@@ -627,44 +706,55 @@ class ReplacementDialog(tk.Toplevel):
 
         self._build(filenames)
         self.update_idletasks()
-        # Ограничиваем высоту окна
-        w, h = 660, min(80 + len(filenames) * 38 + 80, 560)
+        w = 680
+        h = min(110 + len(filenames) * 36 + 70, 580)
         self.geometry(f'{w}x{h}')
-        self.minsize(520, 200)
+        self.minsize(520, 260)
         self.transient(parent)
         self.grab_set()
         self.wait_window()
 
     def _build(self, filenames: List[str]) -> None:
+        # ── Заголовок ──────────────────────────────────────────────────────
         ttk.Label(self,
-                  text='Введите название, которым будут заменены хосты в каждом файле:',
+                  text='Введите название для замены хостов в каждом файле:',
                   font=('Arial', 10), padding=(12, 10, 12, 2)).pack(anchor='w')
         ttk.Label(self,
-                  text='⚠  Кнопка «Применить» станет активна только после заполнения всех полей.',
-                  font=('Arial', 9), foreground='#888888',
-                  padding=(12, 0, 12, 8)).pack(anchor='w')
+                  text='Незаполненные файлы будут пропущены (появится предупреждение).',
+                  font=('Arial', 9), foreground='#666',
+                  padding=(12, 0, 12, 6)).pack(anchor='w')
 
-        # Прокручиваемая область
-        wrap  = ttk.Frame(self)
+        # ── Кнопки — пакуем ПЕРВЫМИ с side='bottom', чтобы всегда были видны
+        ttk.Separator(self, orient='horizontal').pack(
+            side='bottom', fill='x', padx=10, pady=(4, 0))
+        bfr = ttk.Frame(self, padding=(10, 6, 10, 10))
+        bfr.pack(side='bottom', fill='x')
+        ttk.Button(bfr, text='Отмена',
+                   command=self.destroy).pack(side='right', padx=(4, 0))
+        self._ok = ttk.Button(bfr, text='✔  Применить',
+                               command=self._ok_clicked)
+        self._ok.pack(side='right')
+
+        # ── Прокручиваемая область ─────────────────────────────────────────
+        wrap   = ttk.Frame(self)
         wrap.pack(fill='both', expand=True, padx=10, pady=(0, 4))
-
         canvas = tk.Canvas(wrap, borderwidth=0, highlightthickness=0)
         scroll = ttk.Scrollbar(wrap, orient='vertical', command=canvas.yview)
         inner  = ttk.Frame(canvas)
         canvas.configure(yscrollcommand=scroll.set)
         canvas.pack(side='left', fill='both', expand=True)
         scroll.pack(side='right', fill='y')
-
         fid = canvas.create_window((0, 0), window=inner, anchor='nw')
-        inner.bind('<Configure>', lambda e: canvas.configure(
-            scrollregion=canvas.bbox('all')))
-        canvas.bind('<Configure>', lambda e: canvas.itemconfig(fid, width=e.width))
+        inner.bind('<Configure>',
+                   lambda e: canvas.configure(scrollregion=canvas.bbox('all')))
+        canvas.bind('<Configure>',
+                    lambda e: canvas.itemconfig(fid, width=e.width))
 
         for fname in filenames:
             row = ttk.Frame(inner, padding=(6, 3, 6, 3))
             row.pack(fill='x')
             ttk.Label(row, text=fname, anchor='w',
-                      font=('Consolas', 9), width=42).pack(side='left')
+                      font=('Consolas', 9), width=40).pack(side='left')
             ttk.Label(row, text='→', font=('Arial', 10)).pack(side='left', padx=4)
             var = tk.StringVar()
             var.trace_add('write', lambda *_: self._validate())
@@ -672,22 +762,37 @@ class ReplacementDialog(tk.Toplevel):
             ttk.Entry(row, textvariable=var, font=('Arial', 10),
                       width=28).pack(side='left', fill='x', expand=True)
 
-        # Кнопки
-        ttk.Separator(self, orient='horizontal').pack(fill='x', padx=10, pady=4)
-        bfr = ttk.Frame(self, padding=(10, 0, 10, 10))
-        bfr.pack(fill='x')
-        self._ok = ttk.Button(bfr, text='✔  Применить',
-                               command=self._ok_clicked, state='disabled')
-        self._ok.pack(side='right', padx=(4, 0))
-        ttk.Button(bfr, text='Отмена',
-                   command=self.destroy).pack(side='right')
+        self._validate()
 
     def _validate(self) -> None:
-        ok = all(v.get().strip() for v in self._vars.values())
-        self._ok.state(['!disabled'] if ok else ['disabled'])
+        filled  = sum(1 for v in self._vars.values() if v.get().strip())
+        total   = len(self._vars)
+        if filled == 0:
+            self._ok.configure(text='✔  Применить')
+            self._ok.state(['disabled'])
+        elif filled == total:
+            self._ok.configure(text='✔  Применить ко всем')
+            self._ok.state(['!disabled'])
+        else:
+            self._ok.configure(text=f'✔  Применить к {filled} из {total}')
+            self._ok.state(['!disabled'])
 
     def _ok_clicked(self) -> None:
-        self.result = {f: v.get().strip() for f, v in self._vars.items()}
+        filled  = {f: v.get().strip() for f, v in self._vars.items()
+                   if v.get().strip()}
+        skipped = [f for f, v in self._vars.items() if not v.get().strip()]
+
+        if skipped:
+            show = skipped[:8]
+            tail = f'\n  … и ещё {len(skipped)-8}' if len(skipped) > 8 else ''
+            msg  = (f'Не заполнено {len(skipped)} файл(ов) — '
+                    f'они не будут изменены:\n\n' +
+                    '\n'.join(f'  • {f}' for f in show) + tail +
+                    '\n\nПродолжить?')
+            if not messagebox.askyesno('Внимание', msg, parent=self):
+                return
+
+        self.result = filled
         self.destroy()
 
 
@@ -861,24 +966,27 @@ class App:
         ttk.Separator(t, orient='horizontal').pack(fill='x', padx=12)
         bot = ttk.Frame(t, padding=(12, 8, 12, 10))
         bot.pack(fill='x')
+        bot.columnconfigure(0, weight=1)
+        bot.columnconfigure(1, weight=1)
+        bot.columnconfigure(2, weight=1)
 
         self._btn_a = ttk.Button(
             bot,
-            text='Нет интересных хостов\n→ Задать замену для каждого файла  (Сцен. А)',
-            style='Action.TButton', command=self._run_scenario_a, width=42)
-        self._btn_a.pack(side='left', padx=(0, 6))
+            text='Нет интересных хостов\n→ Задать замену  (Сцен. А)',
+            style='Action.TButton', command=self._run_scenario_a)
+        self._btn_a.grid(row=0, column=0, sticky='ew', padx=(0, 3), ipady=4)
 
         self._btn_b = ttk.Button(
             bot,
-            text='✔  Отметить выбранные как "dang"\n    (Сценарий Б)',
-            style='Action.TButton', command=self._run_scenario_b, width=28)
-        self._btn_b.pack(side='left', padx=(0, 6))
+            text='✔  Отметить выбранные\n    как "dang"  (Сцен. Б)',
+            style='Action.TButton', command=self._run_scenario_b)
+        self._btn_b.grid(row=0, column=1, sticky='ew', padx=3, ipady=4)
 
         self._btn_del = ttk.Button(
             bot,
-            text='🗑  Удалить строки\n    с выбранными хостами',
-            style='Del.TButton', command=self._run_delete, width=22)
-        self._btn_del.pack(side='right')
+            text='🗑  Удалить строки с\n    выбранными хостами',
+            style='Del.TButton', command=self._run_delete)
+        self._btn_del.grid(row=0, column=2, sticky='ew', padx=(3, 0), ipady=4)
 
     # ── Логика Tab 1 ──────────────────────────────────────────────────────
 
@@ -900,9 +1008,24 @@ class App:
             return
         if self._busy:
             return
+
+        # ── Проверка блокировок ДО начала обработки ────────────────────────
+        self._p1lbl.set('Проверка доступа к файлам…')
+        self.root.update_idletasks()
+        locked = check_file_locks(folder)
+        if locked:
+            self._p1lbl.set('')
+            list_txt = '\n'.join(f'  • {f}' for f in locked)
+            messagebox.showerror(
+                'Файлы заняты',
+                f'Следующие файлы открыты в другой программе '
+                f'(закройте их и повторите):\n\n{list_txt}')
+            return
+
         self._folder = folder
         self._set_busy1(True)
         self._p1v.set(0)
+        self._p1lbl.set('Запуск…')
 
         def run():
             try:
@@ -916,11 +1039,13 @@ class App:
                                              messagebox.showerror('Ошибка', msg)])
         threading.Thread(target=run, daemon=True).start()
 
-    def _p1cb(self, done: int, total: int) -> None:
-        pct, d, t = done / total * 100 if total else 100, done, total
+    def _p1cb(self, done: int, total: int, fname: str = '') -> None:
+        pct = done / total * 100 if total else 100
+        d, t, fn = done, total, fname
         def _u():
             self._p1v.set(pct)
-            self._p1lbl.set(f'Файлов: {d} / {t}')
+            short = fn[:45] + '…' if len(fn) > 48 else fn
+            self._p1lbl.set(f'[{d}/{t}]  {short}  ({pct:.0f}%)')
         self.root.after(0, _u)
 
     def _on_p1_done(self, rows: list, out: Path) -> None:
@@ -1277,3 +1402,4 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
+    
