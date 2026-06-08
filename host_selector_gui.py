@@ -876,9 +876,19 @@ class App:
 
         pfr = ttk.Frame(t, padding=(12, 6, 12, 0))
         pfr.pack(fill='x')
+
+        # Строка операции (показывает что сейчас делается)
+        self._p1_op = tk.StringVar(value='')
+        self._p1_oplbl = ttk.Label(pfr, textvariable=self._p1_op,
+                                    font=('Arial', 9, 'italic'),
+                                    foreground='#1565c0', anchor='w')
+        self._p1_oplbl.pack(fill='x', pady=(0, 2))
+
+        # Вертикальный бар: сначала indeterminate, потом determinate по файлам
         self._p1v = tk.DoubleVar(value=0)
-        ttk.Progressbar(pfr, variable=self._p1v, mode='determinate',
-                        maximum=100).pack(fill='x')
+        self._p1bar = ttk.Progressbar(pfr, variable=self._p1v,
+                                       mode='determinate', maximum=100)
+        self._p1bar.pack(fill='x')
         self._p1lbl = tk.StringVar(value='')
         ttk.Label(pfr, textvariable=self._p1lbl,
                   font=('Arial', 9), anchor='w').pack(fill='x', pady=(2, 0))
@@ -950,17 +960,37 @@ class App:
         self._tree.tag_configure('unk_emp',   background='',
                                   foreground='#999999')
 
-        # Статус
+        # ── Статус (всегда виден) ─────────────────────────────────────────
         ttk.Separator(t, orient='horizontal').pack(fill='x', padx=12, pady=(4, 0))
         self._stv = tk.StringVar(value='—')
         self._stlbl = ttk.Label(t, textvariable=self._stv,
                                  font=('Arial', 9), anchor='w', padding=(12, 3))
         self._stlbl.pack(fill='x')
 
-        # Прогрессбар (скрыт)
-        self._p2v = tk.DoubleVar(value=0)
-        self._p2  = ttk.Progressbar(t, variable=self._p2v,
-                                     mode='determinate', maximum=100)
+        # ── Панель прелоадера ─────────────────────────────────────────────
+        # Внешний фрейм всегда в иерархии (высота 0 когда скрыт).
+        # Внутренний показывается/скрывается через pack/pack_forget.
+        self._busy_outer = ttk.Frame(t)
+        self._busy_outer.pack(fill='x', padx=12)
+
+        self._busy_inner = ttk.Frame(self._busy_outer, padding=(0, 4, 0, 4))
+        # Строка 1: прогрессбар
+        self._busy_pv  = tk.DoubleVar(value=0)
+        self._busy_bar = ttk.Progressbar(
+            self._busy_inner, variable=self._busy_pv,
+            mode='indeterminate', maximum=100)
+        self._busy_bar.pack(fill='x')
+        # Строка 2: название операции
+        self._busy_op  = tk.StringVar(value='')
+        ttk.Label(self._busy_inner, textvariable=self._busy_op,
+                  font=('Arial', 9, 'bold'), foreground='#1565c0',
+                  anchor='w').pack(fill='x', pady=(3, 0))
+        # Строка 3: детали (текущий файл)
+        self._busy_det = tk.StringVar(value='')
+        ttk.Label(self._busy_inner, textvariable=self._busy_det,
+                  font=('Arial', 8, 'italic'), foreground='#555',
+                  anchor='w').pack(fill='x')
+        # (внутренний фрейм пока не packed — скрыт)
 
         # Кнопки действий
         ttk.Separator(t, orient='horizontal').pack(fill='x', padx=12)
@@ -1025,7 +1055,11 @@ class App:
         self._folder = folder
         self._set_busy1(True)
         self._p1v.set(0)
-        self._p1lbl.set('Запуск…')
+        self._p1lbl.set('')
+        self._p1_op.set('⚙  Удаление лишних столбцов и сбор хостов…')
+        # Запускаем бар в indeterminate до первого завершённого файла
+        self._p1bar.configure(mode='indeterminate')
+        self._p1bar.start(12)
 
         def run():
             try:
@@ -1035,22 +1069,33 @@ class App:
                 self.root.after(0, lambda: self._on_p1_done(rows, out))
             except Exception as exc:
                 msg = str(exc)
-                self.root.after(0, lambda: [self._set_busy1(False),
-                                             messagebox.showerror('Ошибка', msg)])
+                self.root.after(0, lambda: [
+                    self._set_busy1(False),
+                    self._p1bar.stop(),
+                    self._p1_op.set('✗  Ошибка обработки'),
+                    self._p1_oplbl.configure(foreground='#c62828'),
+                    messagebox.showerror('Ошибка', msg)])
         threading.Thread(target=run, daemon=True).start()
 
     def _p1cb(self, done: int, total: int, fname: str = '') -> None:
         pct = done / total * 100 if total else 100
         d, t, fn = done, total, fname
         def _u():
+            # Первый завершённый файл — переключаемся на determinate
+            self._p1bar.stop()
+            self._p1bar.configure(mode='determinate')
             self._p1v.set(pct)
-            short = fn[:45] + '…' if len(fn) > 48 else fn
+            short = fn[:48] + '…' if len(fn) > 51 else fn
             self._p1lbl.set(f'[{d}/{t}]  {short}  ({pct:.0f}%)')
         self.root.after(0, _u)
 
     def _on_p1_done(self, rows: list, out: Path) -> None:
         self._set_busy1(False)
+        self._p1bar.stop()
+        self._p1bar.configure(mode='determinate')
         self._p1v.set(100)
+        self._p1_op.set('✓  Обработка завершена')
+        self._p1_oplbl.configure(foreground='#2e7d32')
         self._load_hosts_from(out)
         self._nb.tab(1, state='normal')
         self._nb.select(1)
@@ -1078,6 +1123,10 @@ class App:
     # ── Загрузка хостов ───────────────────────────────────────────────────
 
     def _load_hosts_from(self, path: Path) -> None:
+        # Мини-индикатор на время чтения Excel (синхронный, но быстрый)
+        old_stv = self._stv.get()
+        self._stv.set(f'⟳  Загрузка {path.name}…')
+        self.root.update_idletasks()
         try:
             df = pd.read_excel(path)
             lc = 'Название файла' if 'Название файла' in df.columns else df.columns[-2]
@@ -1100,6 +1149,7 @@ class App:
             log.info(f'Загружено: {len(self._data)} файлов, '
                      f'{sum(len(v) for v in self._data.values())} хостов')
         except Exception as exc:
+            self._stv.set(old_stv)
             log.error(f'Ошибка загрузки: {exc}', exc_info=True)
             messagebox.showerror('Ошибка загрузки', str(exc))
 
@@ -1268,21 +1318,43 @@ class App:
 
     # ── Состояние «занят» ─────────────────────────────────────────────────
 
-    def _set_busy2(self, busy: bool) -> None:
+    def _set_busy2(self, busy: bool, operation: str = '') -> None:
+        """
+        busy=True  → показывает прелоадер с названием операции (indeterminate).
+        busy=False → скрывает прелоадер, восстанавливает статус.
+        """
         self._busy = busy
         for b in (self._btn_a, self._btn_b, self._btn_del):
             b.state(('disabled',) if busy else ('!disabled',))
-        if busy:
-            self._p2v.set(0)
-            self._p2.pack(fill='x', padx=12, pady=(0, 2), after=self._stlbl)
-        else:
-            self._p2.pack_forget()
 
-    def _p2cb(self, done: int, total: int) -> None:
-        pct, d, t = done / total * 100 if total else 100, done, total
+        if busy:
+            self._busy_pv.set(0)
+            self._busy_op.set(f'⚙  {operation}' if operation else '⚙  Обработка…')
+            self._busy_det.set('')
+            self._busy_bar.configure(mode='indeterminate')
+            self._busy_bar.start(12)
+            self._busy_inner.pack(fill='x')
+        else:
+            self._busy_bar.stop()
+            self._busy_inner.pack_forget()
+            self._update_status()
+
+    def _p2cb(self, done: int, total: int, fname: str = '') -> None:
+        """
+        Вызывается из фонового потока после завершения каждого файла.
+        Переключает бар в determinate-режим и показывает детали.
+        """
+        pct = done / total * 100 if total else 100
+        d, t, fn = done, total, fname
         def _u():
-            self._p2v.set(pct)
-            self._stv.set(f'Обработка файлов: {d} / {t}')
+            # Первый файл завершён — переключаем на determinate
+            self._busy_bar.stop()
+            self._busy_bar.configure(mode='determinate')
+            self._busy_pv.set(pct)
+            short = fn[:52] + '…' if len(fn) > 55 else fn
+            self._busy_det.set(
+                f'Завершён [{d}/{t}]: {short}  ({pct:.0f}%)' if fn
+                else f'Файлов: {d} / {t}  ({pct:.0f}%)')
         self.root.after(0, _u)
 
     # ── Проверка папки ────────────────────────────────────────────────────
@@ -1307,7 +1379,7 @@ class App:
             return  # пользователь отменил
 
         replacements = dlg.result
-        self._set_busy2(True)
+        self._set_busy2(True, 'Замена хостов в исходных файлах (Сцен. А)…')
 
         def run():
             try:
@@ -1335,7 +1407,7 @@ class App:
             'Сценарий Б — Подтверждение',
             f'Добавить метку "dang" для {n} хоста(-ов)?\n\n⚠ Необратимо.'
         ): return
-        self._set_busy2(True)
+        self._set_busy2(True, f'Добавление метки "dang" для {n} хоста(-ов) (Сцен. Б)…')
         snap = frozenset(self._checked)
         def run():
             try:
@@ -1363,7 +1435,7 @@ class App:
             'Удаление — Подтверждение',
             f'Удалить все строки с {n} выбранным(и) хостом(-ами)?\n\n⚠ Необратимо.'
         ): return
-        self._set_busy2(True)
+        self._set_busy2(True, f'Удаление строк с {n} выбранным(и) хостом(-ами)…')
         snap = frozenset(self._checked)
         def run():
             try:
