@@ -16,6 +16,7 @@ table_tool.py  —  Обработка таблиц (v3)
 """
 
 import os, re, time, logging, threading
+import csv as _csv
 from pathlib import Path
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -100,13 +101,26 @@ def get_drop_idx(hdr: List[str]) -> Set[int]:
 
 
 def detect_csv_encoding(path: Path) -> str:
+    """Определяет кодировку CSV по сырым байтам (не зависит от разделителя)."""
     for enc in ('utf-8-sig', 'utf-8', 'cp1251', 'latin-1'):
         try:
-            pd.read_csv(path, nrows=2, encoding=enc)
+            with open(path, 'r', encoding=enc, errors='strict') as f:
+                f.read(8192)
             return enc
-        except Exception:
+        except (UnicodeDecodeError, Exception):
             continue
     return 'utf-8'
+
+
+def detect_csv_sep(path: Path, enc: str) -> str:
+    """Определяет разделитель CSV через csv.Sniffer (поддерживает , ; Tab |).
+    Корень ошибок «Expected 1 field» и «хосты не видны» — неверный разделитель."""
+    try:
+        with open(path, 'r', encoding=enc, errors='replace') as f:
+            sample = f.read(min(16384, path.stat().st_size))
+        return _csv.Sniffer().sniff(sample, delimiters=',;\t|').delimiter
+    except Exception:
+        return ','
 
 
 def _remove(path: Path) -> None:
@@ -168,21 +182,25 @@ def check_file_locks(folder_path: str) -> List[str]:
 
 def process_csv(filepath: str, fname: str) -> List[Tuple[str, str]]:
     """
-    CSV читается итератором чанков по CHUNK_SIZE строк.
-    В лог выводится номер каждого чанка и диапазон строк.
+    CSV: авто-детект разделителя + Python engine (устойчив к кавычкам и
+    коротким строкам).  on_bad_lines='skip' пропускает испорченные строки.
+    Ключевые причины «хосты не видны»: неверный sep или испорченные строки.
     """
     path  = Path(filepath)
     tmp   = path.with_suffix('.tmp.csv')
     hosts: Set[str] = set()
     enc   = detect_csv_encoding(path)
+    sep   = detect_csv_sep(path, enc)
     t0    = time.perf_counter()
     chunk_num = 0
     rows_read = 0
 
+    log.debug(f"  {fname}: enc={enc!r}  sep={sep!r}")
     try:
         first = True
-        for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE,
-                                  encoding=enc, low_memory=False):
+        for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE, encoding=enc,
+                                  sep=sep, low_memory=False,
+                                  on_bad_lines='skip', engine='python'):
             chunk_num += 1
             r0 = rows_read + 1
             rows_read += len(chunk)
@@ -197,7 +215,7 @@ def process_csv(filepath: str, fname: str) -> List[Tuple[str, str]]:
             if drop:
                 chunk.drop(columns=drop, inplace=True)
 
-            chunk.to_csv(tmp, index=False,
+            chunk.to_csv(tmp, index=False, sep=',',
                          mode='w' if first else 'a',
                          header=first, encoding='utf-8-sig')
             first = False
@@ -407,8 +425,10 @@ def save_hosts_xlsx(all_rows: List[Tuple[str, str]], out: Path) -> None:
 # ══════════════════════════════════════════════════════════════════════════
 
 def _rewrite_csv(fp: Path, transform) -> None:
-    """Перезапись CSV чанками. transform(chunk) -> chunk | None."""
+    """Перезапись CSV чанками. transform(chunk) -> chunk | None.
+    Авто-детект разделителя; Python engine для устойчивости к кавычкам."""
     enc = detect_csv_encoding(fp)
+    sep = detect_csv_sep(fp, enc)
     tmp = fp.with_suffix('.tmp.csv')
     try:
         first     = True
@@ -416,8 +436,9 @@ def _rewrite_csv(fp: Path, transform) -> None:
         chunk_num = 0
         rows_done = 0
         t0 = time.perf_counter()
-        for chunk in pd.read_csv(fp, chunksize=CHUNK_SIZE,
-                                  encoding=enc, low_memory=False):
+        for chunk in pd.read_csv(fp, chunksize=CHUNK_SIZE, encoding=enc,
+                                  sep=sep, low_memory=False,
+                                  on_bad_lines='skip', engine='python'):
             chunk_num += 1
             r0 = rows_done + 1
             rows_done += len(chunk)
@@ -426,7 +447,7 @@ def _rewrite_csv(fp: Path, transform) -> None:
             chunk = transform(chunk)
             if chunk is None or chunk.empty:
                 continue
-            chunk.to_csv(tmp, index=False,
+            chunk.to_csv(tmp, index=False, sep=',',
                          mode='w' if first else 'a',
                          header=first, encoding='utf-8-sig')
             first = False
@@ -434,8 +455,9 @@ def _rewrite_csv(fp: Path, transform) -> None:
         if wrote_any:
             os.replace(tmp, fp)
         else:
-            pd.read_csv(fp, nrows=0, encoding=enc).to_csv(
-                fp, index=False, encoding='utf-8-sig')
+            pd.DataFrame(columns=pd.read_csv(fp, nrows=0, encoding=enc,
+                                              sep=sep, engine='python').columns
+                         ).to_csv(fp, index=False, encoding='utf-8-sig')
             _remove(tmp)
     except PermissionError:
         _remove(tmp)
@@ -491,8 +513,58 @@ def _rewrite_xlsx(fp: Path, transform_row, new_headers_fn=None) -> None:
         _remove(tmp); raise
 
 
+def scan_hosts_only(folder_path: str,
+                    progress_cb: Optional[Callable] = None) -> List[Tuple[str, str]]:
+    """Сканирует хосты из исходных файлов БЕЗ изменения файлов (для обновления списка)."""
+    files = get_source_files(folder_path)
+    all_rows: List[Tuple[str, str]] = []
+    done = 0
+    t0   = time.perf_counter()
+
+    def _scan(fp: Path) -> List[Tuple[str, str]]:
+        fname  = fp.name
+        hosts: Set[str] = set()
+        if fp.suffix.lower() == '.csv':
+            enc = detect_csv_encoding(fp)
+            sep = detect_csv_sep(fp, enc)
+            for chunk in pd.read_csv(fp, chunksize=CHUNK_SIZE, encoding=enc,
+                                      sep=sep, low_memory=False,
+                                      on_bad_lines='skip', engine='python'):
+                hcol = find_host_col_df(chunk)
+                if hcol:
+                    hosts.update(chunk[hcol].fillna('').astype(str).unique())
+        elif fp.suffix.lower() in ('.xlsx', '.xlsm'):
+            wb = load_workbook(fp, read_only=True, data_only=True)
+            ws = wb.active
+            it  = ws.iter_rows(values_only=True)
+            hdr = [str(h) if h is not None else '' for h in next(it)]
+            hi  = find_host_idx(hdr)
+            if hi is not None:
+                for row in it:
+                    r = list(row)
+                    if len(r) > hi:
+                        h = r[hi]
+                        hosts.add('' if h is None else str(h))
+            wb.close()
+        return [(fname, h) for h in hosts]
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        futs = {pool.submit(_scan, f): f for f in files}
+        for fut in as_completed(futs):
+            done += 1
+            fname = futs[fut].name
+            try:
+                all_rows.extend(fut.result())
+            except Exception as exc:
+                log.error(f"Ошибка сканирования {fname}: {exc}")
+            if progress_cb:
+                progress_cb(done, len(files), fname)
+
+    log.info(f"Сканирование: {len(all_rows)} хостов  |  {time.perf_counter()-t0:.2f}с")
+    return all_rows
+
+
 # ══════════════════════════════════════════════════════════════════════════
-#  Сценарий А: заменить все хосты на заданное значение
 # ══════════════════════════════════════════════════════════════════════════
 
 def _replace_csv(fp: Path, val: str) -> None:
