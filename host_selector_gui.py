@@ -199,7 +199,7 @@ def process_csv(filepath: str, fname: str) -> List[Tuple[str, str]]:
     try:
         first = True
         for chunk in pd.read_csv(path, chunksize=CHUNK_SIZE, encoding=enc,
-                                  sep=sep, low_memory=False,
+                                  sep=sep,
                                   on_bad_lines='skip', engine='python'):
             chunk_num += 1
             r0 = rows_read + 1
@@ -215,7 +215,7 @@ def process_csv(filepath: str, fname: str) -> List[Tuple[str, str]]:
             if drop:
                 chunk.drop(columns=drop, inplace=True)
 
-            chunk.to_csv(tmp, index=False, sep=',',
+            chunk.to_csv(tmp, index=False, sep=sep,
                          mode='w' if first else 'a',
                          header=first, encoding='utf-8-sig')
             first = False
@@ -437,7 +437,7 @@ def _rewrite_csv(fp: Path, transform) -> None:
         rows_done = 0
         t0 = time.perf_counter()
         for chunk in pd.read_csv(fp, chunksize=CHUNK_SIZE, encoding=enc,
-                                  sep=sep, low_memory=False,
+                                  sep=sep,
                                   on_bad_lines='skip', engine='python'):
             chunk_num += 1
             r0 = rows_done + 1
@@ -447,7 +447,7 @@ def _rewrite_csv(fp: Path, transform) -> None:
             chunk = transform(chunk)
             if chunk is None or chunk.empty:
                 continue
-            chunk.to_csv(tmp, index=False, sep=',',
+            chunk.to_csv(tmp, index=False, sep=sep,
                          mode='w' if first else 'a',
                          header=first, encoding='utf-8-sig')
             first = False
@@ -457,7 +457,7 @@ def _rewrite_csv(fp: Path, transform) -> None:
         else:
             pd.DataFrame(columns=pd.read_csv(fp, nrows=0, encoding=enc,
                                               sep=sep, engine='python').columns
-                         ).to_csv(fp, index=False, encoding='utf-8-sig')
+                         ).to_csv(fp, index=False, sep=sep, encoding='utf-8-sig')
             _remove(tmp)
     except PermissionError:
         _remove(tmp)
@@ -528,7 +528,7 @@ def scan_hosts_only(folder_path: str,
             enc = detect_csv_encoding(fp)
             sep = detect_csv_sep(fp, enc)
             for chunk in pd.read_csv(fp, chunksize=CHUNK_SIZE, encoding=enc,
-                                      sep=sep, low_memory=False,
+                                      sep=sep,
                                       on_bad_lines='skip', engine='python'):
                 hcol = find_host_col_df(chunk)
                 if hcol:
@@ -1546,4 +1546,3 @@ def main() -> None:
 
 if __name__ == '__main__':
     main()
-    
